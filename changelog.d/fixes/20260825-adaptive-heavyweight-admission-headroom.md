@@ -1,0 +1,1 @@
+- **fix(admission):** derive bounded healthy heavyweight headroom from the tightest V8/cgroup available-memory budget, with conservative configurable request cost, temporal recovery, exact overrides, and process-global safety.
