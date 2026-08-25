@@ -18,8 +18,16 @@
 import { CORS_HEADERS } from "../utils/cors";
 import { createLogger } from "../utils/logger";
 import { createHmac } from "crypto";
-import v8 from "node:v8";
 import { trackRequest } from "../../lib/gracefulShutdown";
+import {
+  createConfiguredRuntimeHeavyHeadroom,
+  defaultHeapPressureCheck,
+  type RuntimeHeavyHeadroomPolicy,
+  type RuntimeHeavyHeadroomReason,
+} from "./chatAdmissionHeadroom";
+
+export { CHAT_ADMISSION_HEAP_SHED_RATIO } from "./chatAdmissionHeadroom";
+export { defaultHeapPressureCheck } from "./chatAdmissionHeadroom";
 
 function parsePositiveInt(value: string | undefined, fallback: number): number {
   const parsed = Number.parseInt(String(value), 10);
@@ -84,59 +92,10 @@ export const CHAT_HEAVY_ESTIMATED_TOKENS = parsePositiveInt(
   32_000
 );
 
-/**
- * Heap-pressure shed ratio for the structural admission gate (#10183, #10268).
- *
- * 3.8.48 only shed a heavy request once `heapUsed / heapLimit >= shedRatio` (0.75).
- * 3.8.49 (#9654/#9940) replaced that heap-conditional shed with an unconditional
- * `CHAT_MAX_HEAVY_IN_FLIGHT=1` structural lease, so a second concurrent "heavy"
- * request (coding-agent fan-out is the common trigger) was hard-rejected with a
- * retryable 503 even on a host with ample free RAM. This restores the heap
- * condition as an ADDITIONAL gate layered on top of the bounded-concurrency /
- * per-connection-lane protection from #9654 (that protection stays in force —
- * this constant only decides whether a *busy* lease is still shed with a 503 or
- * admitted anyway because the heap has real headroom).
- */
-export const CHAT_ADMISSION_HEAP_SHED_RATIO = (() => {
-  const parsed = Number(process.env.OMNIROUTE_CHAT_ADMISSION_HEAP_SHED_RATIO);
-  return Number.isFinite(parsed) && parsed > 0 && parsed <= 1 ? parsed : 0.75;
-})();
+const runtimeHeadroom = createConfiguredRuntimeHeavyHeadroom(CHAT_MAX_HEAVY_IN_FLIGHT);
+export const CHAT_ADMISSION_HEALTHY_HEADROOM = runtimeHeadroom.healthyHeadroom;
+const runtimeHealthyHeadroomPolicy = runtimeHeadroom.policy;
 
-/**
- * Bounded extra capacity for the "healthy heap" fast path (#10437).
- *
- * The #10183/#10268 fix above admits a busy heavyweight request immediately whenever
- * `heapPressureCheck()` is false — but with no bound of its own, that path let an
- * UNLIMITED number of "healthy heap" requests pile in ahead of the heap-pressure
- * shed, defeating the point of admission control: a slow leak or a burst that never
- * quite trips the heap-pressure ratio could still starve the process. This constant
- * caps how many requests may bypass the primary `CHAT_MAX_HEAVY_IN_FLIGHT` lease via
- * the healthy-heap path at once (tracked independently, per `ChatAdmissionController`
- * instance — see `#activeHealthy` / `tryAcquireHealthyHeadroom`). Once this budget is
- * also exhausted, requests fall through to the SAME bounded-wait/shed path used under
- * real heap pressure, so there is still a real ceiling either way.
- */
-export const CHAT_ADMISSION_HEALTHY_HEADROOM = parseNonNegativeInt(
-  process.env.OMNIROUTE_CHAT_ADMISSION_HEALTHY_HEADROOM,
-  CHAT_MAX_HEAVY_IN_FLIGHT
-);
-
-/**
- * Live `heapUsed / heap_size_limit` pressure probe, injectable for deterministic
- * tests (`admitChatStructure({ heapPressureCheck })`). Defaults to the real V8
- * heap statistics. Any read failure is treated as "not under pressure" so a
- * transient stats error never turns into a false structural shed.
- */
-export function defaultHeapPressureCheck(): boolean {
-  try {
-    const heapUsed = process.memoryUsage().heapUsed;
-    const heapLimit = v8.getHeapStatistics().heap_size_limit;
-    if (!Number.isFinite(heapLimit) || heapLimit <= 0) return false;
-    return heapUsed / heapLimit >= CHAT_ADMISSION_HEAP_SHED_RATIO;
-  } catch {
-    return false;
-  }
-}
 /**
  * Optional per-deployment history cap. `0` (the default) disables it.
  *
@@ -220,10 +179,6 @@ function defaultChatAdmissionShedSink(event: ChatAdmissionShedEvent): void {
 export class ChatAdmissionController {
   #activeHeavy = 0;
   #queuedBytes = 0;
-  /** #10437: independent counter for the bounded "healthy heap" headroom budget —
-   * separate from `#activeHeavy` so it never inflates the documented
-   * `CHAT_MAX_HEAVY_IN_FLIGHT` bound, but still a real, finite ceiling instead of
-   * the unconditional bypass this replaces. */
   #activeHealthy = 0;
   /** Per-key FIFOs. A key groups one client's waiters so they are served
    * round-robin against the shared budget instead of monopolizing a strict
@@ -238,6 +193,7 @@ export class ChatAdmissionController {
   #shedTotal = 0;
   #shedsByReason = new Map<string, number>();
   readonly #onShed: ChatAdmissionShedSink;
+  readonly #healthyHeadroomPolicy: RuntimeHeavyHeadroomPolicy | null;
 
   constructor(
     readonly maxHeavyInFlight = 1,
@@ -248,7 +204,9 @@ export class ChatAdmissionController {
     readonly healthyHeadroom = CHAT_ADMISSION_HEALTHY_HEADROOM,
     /** #11244: sink notified once per structural shed. Defaults to the shared pino
      * logger (warn); tests inject a capture/no-op sink. */
-    onShed: ChatAdmissionShedSink = defaultChatAdmissionShedSink
+    onShed: ChatAdmissionShedSink = defaultChatAdmissionShedSink,
+    /** Optional runtime policy; numeric-only controllers stay deterministic. */
+    healthyHeadroomPolicy: RuntimeHeavyHeadroomPolicy | null = null
   ) {
     if (!Number.isSafeInteger(maxHeavyInFlight) || maxHeavyInFlight < 1) {
       throw new RangeError("maxHeavyInFlight must be a positive integer");
@@ -260,6 +218,7 @@ export class ChatAdmissionController {
       throw new RangeError("healthyHeadroom must be a non-negative integer");
     }
     this.#onShed = onShed;
+    this.#healthyHeadroomPolicy = healthyHeadroomPolicy;
   }
 
   get activeHeavy(): number {
@@ -271,6 +230,25 @@ export class ChatAdmissionController {
     return this.#activeHealthy;
   }
 
+  get healthyHeadroomSnapshot(): {
+    configuredHeadroom: number | null;
+    effectiveHeadroom: number;
+    reason: RuntimeHeavyHeadroomReason;
+  } {
+    const adaptive = this.#healthyHeadroomPolicy?.snapshot();
+    return adaptive
+      ? {
+          configuredHeadroom: adaptive.configuredHeadroom,
+          effectiveHeadroom: adaptive.effectiveHeadroom,
+          reason: adaptive.reason,
+        }
+      : {
+          configuredHeadroom: this.healthyHeadroom,
+          effectiveHeadroom: this.healthyHeadroom,
+          reason: "environment_override",
+        };
+  }
+
   /**
    * Acquire one slot from the bounded, independent healthy-heap headroom budget
    * (#10437). Unlike `tryAcquireHeavy()`, this never contends with the primary
@@ -280,7 +258,9 @@ export class ChatAdmissionController {
    * at which point the caller must fall through to the bounded-wait/shed path.
    */
   tryAcquireHealthyHeadroom(): ChatAdmissionLease | null {
-    if (this.#activeHealthy >= this.healthyHeadroom) return null;
+    const effectiveHeadroom =
+      this.#healthyHeadroomPolicy?.getEffectiveHeadroom() ?? this.healthyHeadroom;
+    if (this.#activeHealthy >= effectiveHeadroom) return null;
     this.#activeHealthy += 1;
     const done = trackRequest();
     let released = false;
@@ -507,7 +487,13 @@ export class ChatAdmissionController {
   }
 }
 
-const defaultAdmissionController = new ChatAdmissionController(CHAT_MAX_HEAVY_IN_FLIGHT);
+const defaultAdmissionController = new ChatAdmissionController(
+  CHAT_MAX_HEAVY_IN_FLIGHT,
+  undefined,
+  CHAT_ADMISSION_HEALTHY_HEADROOM,
+  undefined,
+  runtimeHealthyHeadroomPolicy
+);
 
 /**
  * Process-wide byte-level admission budget (#10110).
@@ -583,13 +569,19 @@ export class PerConnectionAdmissionController {
     // accepted for API compatibility and ignored — there are no per-session lanes
     // to evict. `onShed` (#11244) is live: it replaces the shed sink of the shared
     // controller (tests inject a capture/no-op sink; production keeps the pino warn).
-    _opts?: { maxSessions?: number; sessionTtlMs?: number; onShed?: ChatAdmissionShedSink }
+    _opts?: {
+      maxSessions?: number;
+      sessionTtlMs?: number;
+      onShed?: ChatAdmissionShedSink;
+      healthyHeadroomPolicy?: RuntimeHeavyHeadroomPolicy;
+    }
   ) {
     this.#controller = new ChatAdmissionController(
       maxHeavyInFlight,
       undefined,
       undefined,
-      _opts?.onShed
+      _opts?.onShed,
+      _opts?.healthyHeadroomPolicy
     );
   }
 
@@ -606,15 +598,22 @@ export class PerConnectionAdmissionController {
   snapshot(): {
     activeHeavy: number;
     activeHealthyHeadroom: number;
+    configuredHealthyHeadroom: number | null;
+    effectiveHealthyHeadroom: number;
+    healthyHeadroomReason: RuntimeHeavyHeadroomReason;
     queuedBytes: number;
     waiting: number;
     lanes: ReadonlyArray<{ key: string; waiting: number }>;
     shedTotal: number;
     shedsByReason: Record<string, number>;
   } {
+    const healthyHeadroom = this.#controller.healthyHeadroomSnapshot;
     return {
       activeHeavy: this.#controller.activeHeavy,
       activeHealthyHeadroom: this.#controller.activeHealthyHeadroom,
+      configuredHealthyHeadroom: healthyHeadroom.configuredHeadroom,
+      effectiveHealthyHeadroom: healthyHeadroom.effectiveHeadroom,
+      healthyHeadroomReason: healthyHeadroom.reason,
       queuedBytes: this.#controller.queuedBytes,
       waiting: this.#controller.waitingCount,
       lanes: this.#controller.waitersByKey,
@@ -642,7 +641,8 @@ export class PerConnectionAdmissionController {
 }
 
 export const perConnectionAdmissionController = new PerConnectionAdmissionController(
-  CHAT_MAX_HEAVY_IN_FLIGHT
+  CHAT_MAX_HEAVY_IN_FLIGHT,
+  { healthyHeadroomPolicy: runtimeHealthyHeadroomPolicy }
 );
 
 export type ChatRequestAdmission =
@@ -970,7 +970,6 @@ export async function admitChatRequest(
   // Internal self-loop: skip the heavyweight reservation entirely (the parent
   // request already holds the single lease) but still enforce the hard byte bound.
   if (internalBypass) {
-    const contentLengthHeader = request.headers.get("content-length");
     if (contentLength !== null && contentLength > hardMaxBytes) {
       return { admit: false, response: rejectionResponse(413, hardMaxBytes) };
     }
